@@ -12,22 +12,6 @@ As you can see these 3 have very different requirements both on speed and sustai
 
 If you have infinite funds, of course, get a single super-fast read, super-fast write, that can do that for days non-stop. But for most of us, this is not possible so getting 2 or 3 different types of partitions where you end up paying much less is a wiser choice.
 
-Incoming suggestions from Ross Wightman to integrate:
-
-- I'd try to separate volumes by workload, so keep the 'lots of small files', high churn like environments, code separate from bulk storage like datasets, checkpoints. Possibly even split those too since datasets are largely static and checkpoints are being rotated all the time
-
-- When datasets are on network storage, just like bucket storage, they should consist of large files AND be read as large files (sequentially in large chunks, not mmapped!). Avoid seeking within datasets
-
-- Setups like HF datasets can be deceiving, might look like one big file, but often being mmap'd and the IO read pattern is nuts, like 3-4x more iops than if you'd read them as individual files.
-  Mmap loading can be turned off, but if that's the case, for a lot of datasets you move a problem into the DataLoader processes, requiring reading too much data into memory at once. Better awareness of tradeoffs for different use cases, and especially using Iterable streaming when appropriate.
-
-- Note that once your datasets are optimally friendly for a large, distributed network filesystem, they can usually just be streamed from bucket storage in cloud systems that have that option. So better to move them off the network filesystem in that case.
-
-- In a way, bucket storage like s3, via the interface limitations, enforces patterns that are reasonable for storage backends like this. It's ooh, it's mounted as a folder, I can do whatever I want (mmap files, write loads of little ones, delete them all, etc) that's the prob.
-
-- One also cannot expect to treat a distributed filesystem like their local disk. If you separated volumes by workload you'd probably be able to utilize much higher % of the total storage. Don't mix high churn, small files with low churn large files.
-
-- Also, note that once your datasets are optimally friendly for a large, distributed network filesystem, they can usually just be streamed from bucket storage in cloud systems that have that option. So better to move them off the network filesystem in that case.
 
 
 
@@ -115,7 +99,7 @@ Here are shared file system storage solutions made available by various cloud pr
 
 ## Local storage beats cloud storage
 
-While cloud storage is cheaper the whole idea of fetching and processing your training data stream dynamically at training time is very problematic with a huge number of issues around it.
+While cloud storage is cheaper the whole idea of fetching and processing your training data stream dynamically at training time is very problematic with a huge number of potential issues around it.
 
 Same goes for dynamic offloading of checkpoints to the cloud.
 
@@ -125,6 +109,7 @@ For checkpointing there should be enough local disk space for saving a checkpoin
 
 case study: we didn't have a choice and had to use cloud storage for dataloading during IDEFICS-80B training as we had barely any local storage and since it was multimodal data it was many TBs of data. We spent many weeks trying to make this solution robust and it sucked at the end. The biggest issue was that it was very difficult at the time to keep track of RNG state for the DataSampler because the solution we used, well, didn't bother to take care of it. So a lot of data that took a lot of time to create was wasted (not used) and a lot of data was repeated, so we didn't have a single epoch of unique data.
 
+In some situations people find good solutions for working with cloud-based datasets, I personally haven't had a smooth experience yet and that's why I advocate local storage. If you found a good streaming solution that can properly resume without losing data and repeating the same data, doesn't require huge local workers then it might work OK.
 
 ## Beware that you're often being sold only 80% of the storage you pay for
 
@@ -331,7 +316,7 @@ Here is an example of this IO scan on my Samsung SSD 980 PRO 2TB NVME drive ([su
 As you can see as of this writing this is a pretty fast NVMe drive if you want to use it as a base-line against, say, a network shared file system.
 
 
-### Poor man's storage IO benchmark
+### Usability perception IO benchmarks
 
 Besides properly designed performance benchmarks which give you some numbers that you may or may not be able to appreciate there is a perception benchmark, and that is how does a certain functionality or a service feel. For example, when going to a website, does it feel like it's taking too long to load a webpage? or when going to a video service, does it take too long for the video to start playing and does it stop every few seconds to buffer the stream?
 
@@ -446,6 +431,25 @@ sys     0m0.734s
 You can see that the first time it wasn't cached and took ~3x longer, then when I run it the second time. And then I told the system to flush memory and file system caches and you can see it was 3x longer again.
 
 I think it might be a good idea to do the memory and file system caching in the write tests again, since even there caching will make the benchmark appear faster than what it would be like in the real world where a new package is installed for the first time.
+
+Another time I noticed that `git status` was taking multiple seconds. I use [bash-git-prompt](https://github.com/magicmonty/bash-git-prompt) and it runs `git status` before every return of the prompt when inside a git repo clone, and it was becoming super sluggish and difficult to work. So I benchmarked `git status`:
+
+```
+git clone https://github.com/pytorch/pytorch
+cd pytorch
+time git status
+```
+and it was taking 3.7secs on this slow file system and needed to be fixed (it was taking 0.02 secs on a local SSD). The good thing this actual perception benchmark was easy to pass to a sysadmin and them reproducing the problem instantly and then working on fixing it, while re-using this benchmark as a reference.
+
+Yet, another time I noticed, `pytest` was taking forever to start, so I measured its collection and it indeed was very slow:
+
+```
+time pytest --disable-warnings --collect-only -q
+```
+
+So now you have a plethora of examples to choose from and I trust you will find your own use cases which are easy to reliably reproduce and use as a reference point for what feels good and what doesn't and which need to be fixed.
+
+
 
 
 ### other tools
@@ -661,6 +665,51 @@ footnote: while `/scratch` is quite common - the mounted local SSD disk mount po
 
 You can also arrange for the SLURM setup to automatically clean up such folders on job's termination.
 
+
+### How to find users who consume a lot of disk space
+
+Do you have a problem when your team trains models and you constantly have to buy more storage because huge model checkpoints aren't being offloaded to bucket storage fast enough?
+
+Here is a one-liner that will recursively analyze a path of your choice, find all the checkpoints, sum up their sizes and print the totals sorted by the biggest user, so that you could tell them to clean up their act :) Just edit `/mypath` to the actual path
+
+```
+find /mypath/ -regextype posix-egrep -regex ".*\.(pt|pth|ckpt|safetensors)$" | \
+perl -nle 'chomp; ($uid,$size)=(stat($_))[4,7]; $x{$uid}+=$size;
+END { map { printf qq[%-10s: %7.1fTB\n], (getpwuid($_))[0], $x{$_}/2**40 }
+sort { $x{$b} <=> $x{$a} } keys %x }'
+```
+
+gives:
+```
+user_a    :     2.5TB
+user_c    :     1.6TB
+user_b   :      1.2TB
+```
+
+Of course, you can change the regex to match other patterns or you can remove it altogether to measure all files:
+
+```
+find /mypath/ | \
+perl -nle 'chomp; ($uid,$size)=(stat($_))[4,7]; $x{$uid}+=$size;
+END { map { printf qq[%-10s: %7.1fTB\n], (getpwuid($_))[0], $x{$_}/2**40 }
+sort { $x{$b} <=> $x{$a} } keys %x }'
+```
+
+
+### How to automatically delete old checkpoints
+
+Continuing the item from above, if you want to automatically delete old checkpoints instead (e.g. those older than 30 days).
+
+First try to ensure the candidates are indeed good to delete:
+
+```
+find /mypath/ -regextype posix-egrep -regex ".*\.(pt|pth|ckpt|safetensors)$" -mtime +30
+```
+
+and when you feel it's safe to delete, only then add `rm`
+```
+find /mypath/ -regextype posix-egrep -regex ".*\.(pt|pth|ckpt|safetensors)$" -mtime +30 -exec rm {} +
+```
 
 ## Contributors
 

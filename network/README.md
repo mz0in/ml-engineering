@@ -1,11 +1,10 @@
-# Inter-node and intra-node Networking Hardware
+# Inter-node and Intra-Node Networking Hardware
 
 **Subsections**:
 
 - [Benchmarks](benchmarks)
 
-
-This chapter is a WIP
+## Introduction
 
 It's not enough to buy/rent expensive accelerators to train and infer models fast. You need to ensure that your [storage IO](../storage), [CPU](../compute/cpu) and network are fast enough to "feed the accelerator furnace". If this is not ensured then the expensive accelerators will be underutilized leading to lost $$, slower training time and inference throughput. While it can be any other of the mentioned components, the network is often the bottleneck during the training (assume your DataLoader is fast).
 
@@ -17,8 +16,12 @@ When the model spans several accelerators and doesn't leave a single node all yo
 
 This article covers both types of networking hardware, reports their theoretical and effective bandwidths and explains how they inter-play with each other.
 
-## Glossary
+## Glossary and concepts
 
+You can safely ignore the many concepts and abbreviations listed here until you need to understand one.
+
+- AR: Adaptive Routing (but also could mean Aggregation Router)
+- ALU: Arithmetic Logic Units
 - DMA: Direct Memory Access
 - EFA: Elastic Fabric Adapter
 - HCA: Host Channel Adapter
@@ -26,19 +29,382 @@ This article covers both types of networking hardware, reports their theoretical
 - MFU: Model Flops Utilization (e.g. `mfu=0.5` at half-precision on A100 comes from getting 156TFLOPs, because peak half-precision spec is 312TFLOPS, and thus `156/312=0.5`)
 - NIC: Network Interface Card
 - OPA: Omni-Path Architecture
+- RDMA: Remote Direct Memory Access
 - RoCE: RDMA over Converged Ethernet
 - RoE: RDMA over Ethernet
+- SHARP: Scalable Hierarchical Aggregation Reduction Protocol
 - VPI: Virtual Protocol Interconnect
-- RDMA: Remote Direct Memory Access
 - xGMI: Socket to Socket Global Memory Interface
 
 Speed-related:
+- Unidirectional: a transmission from one point to another in one direction A -> B
 - Bi-directional, Duplex: a transmission from one point to another in both directions A <-> B, typically 2x speed of unidirectional
 - GBps, GB/s: Gigabytes per secs (1GBps = 8Gbps) transferred in a channel
 - GT/s: GigaTransfers per second - the number of operations transferring data that occur in each second.
 - Gbps, Gb/s: Gigabits per secs (1Gbps = 1/8GBps) transferred in a channel
-- Unidirectional: a transmission from one point to another in one direction A -> B
+- Bisection Width: minimum number of links cut to divide the network into two parts (not necessarily equal). The bandwidth of those links is known as Bisection Bandwidth - which is often used as a metric for real network bandwidth). Sometimes it's referred to as the worst-case network capacity. Here is a [good answer](https://networkengineering.stackexchange.com/a/29662/93656) that explains this and related concepts, but it's unlikely you need to understand this other than knowing what is being meant, as chances are your cluster's topology has already been done by the provider.
+- Adaptive Routing improves Static routing to enable out of order packets on the network. Packets are load balanced at each switch to better distribute the network workload.
+-  Remote Direct Memory Access is like DMA on the node, but across nodes. It allows data exchange between nodes w/o the overhead using the local processor, OS kernel and caches, which is what TCP/IP uses. The 3 main implementations are (1) Infiniband, (2) RDMA over Converged Ethernet (RoCE) (IB or UDP-based RDMA), and (3) iWARP (TCP-based RDMA). here is a [good overview article](https://community.fs.com/article/roce-vs-infiniband-vs-tcp-ip.html).
 
+footnote: In the following sections pay close attention that 1 GBps = 8 Gbps.
+
+
+### Unidirectional vs Bidirectional (Duplex)
+
+Most benchmarking / bandwidth measurement tools will report a unidirectional bandwidth. So be careful when you look at unidirectional vs. bidirectional (duplex) speeds. Typically the latter is ~2x faster.
+
+If you measure the bandwidth on your setup and it's about 40% of the advertised speed, carefully check if the advertised speed said duplex and if so half that and then your measured bandwidth should now be about 80% which is expected.
+
+case study: for a while I couldn't understand why when I run the nccl-tests all_reduce benchmark on an A100 node with advertised 600GBps intra-node speed I was getting only 235Gbps (40%) until Horace He kindly pointed out that I should be looking at unidirectional speed which is 300GBps, and then I get 80% of the theoretical spec which checks out.
+
+
+
+## Intra-node networking
+
+There are multiple platforms/solutions out there that provide intra-node networking:
+
+1. Generic: [PCIe](#pcie)
+2. NVIDIA: [NVLink](#nvlink) and [NVSwitch](#nvswitch)
+3. AMD: [Infinity Fabric](#infinity-fabric--xgmi)
+4. Intel: [Gaudi2](#gaudi2)
+
+Here is intra-node unidirectional theoretical peak bandwidth cross-comparison for current technologies sorted by bandwidth:
+
+| Interconnect    |  GBps |
+| :-----------    | ----: |
+| NVIDIA NVlink 4 | 450.0 |
+| AMD XGMI MI300X | 448.0 |
+| NVIDIA NVlink 3 | 300.0 |
+| AMD XGMI MI250X | 350.0 |
+| Intel Gaudi2    | 262.5 |
+| PCIe 5          | 126.0 |
+| PCIe 4          |  62.0 |
+
+Notes:
+
+* NVSwitch operates at the same speed as NVLink of that generation. See [NVSwitch](#nvswitch) and for inter-node [NVLink Switch](#nvlink-switch).
+* Pay close attention to when the spec says unidirectional vs bidirectional (duplex) speeds - if you read an online spec and it doesn't explicitly declare the directionality - look for an answer. I had to research many docs to figure it out in some of the tables below as some vendors omit this crucial information in the published specs. I even had to edit a few wiki pages to add the missing information. Remember that for the vendors the bigger, the better so almost always they will use the duplex number, which is typically 2x bigger than the unidirectional one.
+
+You will find the details analysis of each technology in the following sections.
+
+
+### PCIe
+
+[PCIe](https://en.wikipedia.org/wiki/PCI_Express) is a high-speed serial computer expansion bus standard that can be found even on the cheapest computer desktop.
+
+| Interconnect | Lane/Direction | Lanes | Unidirection | Duplex   |
+| :----------  | -------------: |  ---: | ----------:  | ------:  |
+| PCIe 4       | ~2.0 GBps      |    16 | 31 GBps      | 62 GBps  |
+| PCIe 5       | ~4.0 GBps      |    16 | 63 GBps      | 126 GBps |
+| PCIe 6       | ~7.5 GBps      |    16 | 121 GBps     | 241 GBps |
+| PCIe 7       | ~15.0 GBps     |    16 | 242 GBps     | 484 GBps |
+
+If one compares the latest generations of different intra-node technologies (see the following sections) PCIe is usually an order of magnitude behind.
+
+
+
+### NVLink
+
+- [NVLink](https://en.wikipedia.org/wiki/NVLink) is a wire-based serial multi-lane near-range communications link developed by Nvidia. Here is the [What Is NVLink](https://blogs.nvidia.com/blog/2023/03/06/what-is-nvidia-nvlink/) blog post with more background on it.
+
+I found the wiki pages quite difficult to follow, so I will try to help bring clarity into this.
+
+Effective payload rate of Intra-node GPU-to-GPU communication hardware:
+
+| Interconnect | Lane/Direction | Lanes | Links | Unidirection | Duplex   |
+|:------------ |---------------:|------:|------:|-------------:|---------:|
+| NVlink 2     | 6.250 GBps     |     4 |     6 | 150 GBps     | 300 GBps |
+| NVlink 3     | 6.250 GBps     |     4 |    12 | 300 GBps     | 600 GBps |
+| NVlink 4     | 6.250 GBps     |     4 |    18 | 450 GBps     | 900 GBps |
+
+
+NVlink 2, 3 and 4 use the same hardware of 4 lanes of 6.250 GBps each per link. Each has a unidirectional bandwidth of 25GB/s per link, and therefore 50GB/s per duplex link. The only difference is in the number of links:
+
+- NVLink 2 has  6 links => `25* 6`=> 150 GBps unidirectional and 300 GBps bi-directional
+- NVLink 3 has 12 links => `25*12`=> 300 GBps unidirectional and 600 GBps bi-directional
+- NVLink 4 has 18 links => `25*18`=> 450 GBps unidirectional and 900 GBps bi-directional
+
+The largest PCIe 16x slot has 16 lanes. Smaller slots have less lanes, 1x == 1 lane.
+
+As of this writing NVIDIA Hopper nodes typically come equipped with PCIe 5 and NVLink 4. So there NVlink is 7x faster than PCIe.
+
+Let's look at several examples of nodes and correlate the theory with reality.
+
+If you use multiple GPUs the way cards are inter-connected can have a huge impact on the total training time. If the GPUs are on the same physical node, you can run:
+
+```
+nvidia-smi topo -m
+```
+
+and it will tell you how the GPUs are inter-connected.
+
+On a machine with dual-GPU and which are connected with NVLink, you will most likely see something like:
+
+```
+        GPU0    GPU1    CPU Affinity    NUMA Affinity
+GPU0     X      NV2     0-23            N/A
+GPU1    NV2      X      0-23            N/A
+```
+
+on a different machine w/o NVLink you may see:
+```
+        GPU0    GPU1    CPU Affinity    NUMA Affinity
+GPU0     X      PHB     0-11            N/A
+GPU1    PHB      X      0-11            N/A
+```
+
+The report includes this legend:
+
+```
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+```
+
+So the first report `NV2` tells us the GPUs are interconnected with 2 NVLinks, and the second report `PHB` we have a typical consumer-level PCIe+Bridge setup.
+
+Check what type of connectivity you have on your setup. Some of these will make the communication between cards faster (e.g. NVLink), others slower (e.g. PHB).
+
+Depending on the type of scalability solution used, the connectivity speed could have a major or a minor impact. If the GPUs need to sync rarely, as in DDP, the impact of a slower connection will be less significant. If the GPUs need to send messages to each other often, as in ZeRO-DP, then faster connectivity becomes super important to achieve faster training.
+
+Now, let's look at the topology of the A100 and H100 nodes:
+
+
+- A100 topology:
+
+```
+$ nvidia-smi topo -m
+      GPU0  GPU1  GPU2  GPU3  GPU4  GPU5  GPU6  GPU7  CPU Affinity  NUMA Affinity
+GPU0   X    NV12  NV12  NV12  NV12  NV12  NV12  NV12   0-23         0
+GPU1  NV12   X    NV12  NV12  NV12  NV12  NV12  NV12   0-23         0
+GPU2  NV12  NV12   X    NV12  NV12  NV12  NV12  NV12   0-23         0
+GPU3  NV12  NV12  NV12   X    NV12  NV12  NV12  NV12   0-23         0
+GPU4  NV12  NV12  NV12  NV12   X    NV12  NV12  NV12  24-47         1
+GPU5  NV12  NV12  NV12  NV12  NV12   X    NV12  NV12  24-47         1
+GPU6  NV12  NV12  NV12  NV12  NV12  NV12   X    NV12  24-47         1
+GPU7  NV12  NV12  NV12  NV12  NV12  NV12  NV12   X    24-47         1
+```
+You can see there are 12 NVLinks and 2 NUMA Groups (2 CPUs w/ 24 cores each)
+
+- H100 topology:
+```
+$ nvidia-smi topo -m
+      GPU0  GPU1  GPU2  GPU3  GPU4  GPU5  GPU6  GPU7  CPU Affinity  NUMA Affinity
+GPU0   X    NV18  NV18  NV18  NV18  NV18  NV18  NV18   0-51         0
+GPU1  NV18   X    NV18  NV18  NV18  NV18  NV18  NV18   0-51         0
+GPU2  NV18  NV18   X    NV18  NV18  NV18  NV18  NV18   0-51         0
+GPU3  NV18  NV18  NV18   X    NV18  NV18  NV18  NV18   0-51         0
+GPU4  NV18  NV18  NV18  NV18   X    NV18  NV18  NV18  52-103        1
+GPU5  NV18  NV18  NV18  NV18  NV18   X    NV18  NV18  52-103        1
+GPU6  NV18  NV18  NV18  NV18  NV18  NV18   X    NV18  52-103        1
+GPU7  NV18  NV18  NV18  NV18  NV18  NV18  NV18   X    52-103        1
+```
+You can see there are 18 NVLinks and 2 NUMA Groups (2 CPUs w/ 52 cores each)
+
+Of course, other A100 and H100s node reports may vary, e.g. different number of cpu cores.
+
+
+
+
+### NVSwitch
+
+[NVSwitch](https://www.nvidia.com/en-us/data-center/nvlink/) can connect more than 8 GPUs at the speed of [NVLink](#nvlink). It's advertised to connect up to 256 GPUs in the future generations of the switch.
+
+The benefit of connecting more than 8 GPUs at the speed of NVLink is that it allows all-to-all GPU communications at a much faster speed than any intra-node hardware can provide. And with ever increasing compute speeds the network is the likely bottleneck leading to underutilized super-expensive GPUs.
+
+For example, in the universe of Tensor Parallelism (Megatron), one doesn't use TP degree of more than 8, because TP is only efficient at NVLink speed. ZeRO-DP (Depspeed/FSDP) would also run much faster if the whole cluster uses NVLink speed and involves no slow inter-node connections.
+
+There are 2 types of NVSwitch:
+1. NVSwitch that is used for intra-node connectivity (L1)
+2. [NVLink Switch](#nvlink-switch) that is used for inter-node connectivity (L2)
+
+NVSwitch gen 1 came out with V100, gen 2 with A100, and gen 3 with H100 - the speed corresponds to the NVLink version of the same technology.
+
+The [NVIDIA DGX H100](https://developer.nvidia.com/blog/upgrading-multi-gpu-interconnectivity-with-the-third-generation-nvidia-nvswitch/) has a 3.6 TBps of full-duplex NVLink Network bandwidth provided by 72 NVLinks (NVLink 4). The normal NVlink 4 has 18 NVLinks (0.9 TBps duplex). So this setup has 4 switches (`18*4=72`) and therefore `0.9*4=3.6` TBps. Note, that this server has 8 GPUs, so here we get a much faster intra-node communications as compared to the standard NVlink 4.0 which provides only 0.9 TBps all-to-all connectivity for 8 GPUs.
+
+NVIDIA DGX A100 has 6 switches of 12 NVlinks for a total of 72.
+
+[DGX H100 SuperPOD](https://developer.nvidia.com/blog/upgrading-multi-gpu-interconnectivity-with-the-third-generation-nvidia-nvswitch/) combines 32 DGX H100 servers, for a total of 256 GPUs. It looks like here they use only half the NVLinks they used for a single DGX H100, so only 1.8 GBps per node, for a total of 57.6 GBps in total.
+
+Additionally, NVSwitch gen3 and higher comes with [NVIDIA Scalable Hierarchical Aggregation Reduction Protocol (SHARP)](#sharp) which can boost both the intra- and inter-node speeds. For example, NCCL is working on `NCCL_ALGO=NVLS` which already boosts the intra-node bandwidth above the normal spec and as of this writing work is being done to boost inter-node bandwidth as well.
+
+
+### Infinity Fabric / xGMI
+
+AMD MI* Accelerators Intra-node communication is performed by AMD Infinity Fabric, which is also known as xGMI (Socket to Socket Global Memory Interface).
+
+This is AMD's answer to [NVLink](#nvlink).
+
+| Interconnect  | Link/Direction | Links | Unidirection | Duplex     |
+| :------------ | -------------: | ----: | -----------: | ---------: |
+| MI250x        | 50 GBps        |     7 | 350 GBps     | 700 GBps   |
+| MI300x        | 64 GBps        |     7 | 448 GBps     | 896 GBps   |
+|               |                |       |              |            |
+
+![AMD Infinity Platform Architecture](images/amd-infinity-arch-MI300X.png)
+
+Platform specs:
+- [MI250X](https://www.amd.com/en/products/accelerators/instinct/mi200/mi250x.html)
+- [MI300x](https://www.amd.com/en/products/accelerators/instinct/mi300/platform.html)
+
+
+
+### Gaudi2
+
+According to [Gaudi2 spec](https://habana.ai/wp-content/uploads/2023/10/HLS-Gaudi2_Datasheet_10_23.pdf), these nodes provide 8x 21 NICs of 100GbE RoCE v2 RDMA for a total of 2.1Tbps intra-node connectivity and each card connected with the other 7 cards at 262.5 GBps.
+
+
+
+## Inter-node networking
+
+As inter-node hardware used to be about of an order of magnitude slower than intra-node hardware in this universe Gbps are used instead of GBps. (1 GBps = 8 Gbps) (Though as of recent inter-node speeds are almost as fast as [intra-node](#intra-node-networking))
+
+When it comes to inter-node networking hardware, there are the well established InfiniBand from NVIDIA and a few other players, various NVLink-based NVIDIA products and there are many new comers that mainly are coming from compute cloud providers who can't compete on the slim margin renting out someone else's hardware so they build their own (AWS EFA, Google GPUDirect-TCPX), and there are also HPE and Cornelis Networks with recently updated products.
+
+Here is inter-node unidirectional theoretical peak bandwidth cross-comparison for current technologies sorted by total bandwidth of common node setups:
+
+| Interconnect              | NICs x Gbps | Total Gbps | Notes   |
+| :-------------------      | ----------: | ---------: | :------ |
+| NVIDIA NVLink Switch gen3 |       8x450 |       3600 | H100    |
+| NVIDIA Quantum-2 IB       |       8x400 |       3200 | H100    |
+| AWS EFA v2                |      32x100 |       3200 | H100    |
+| NVLink Switch gen2        |       8x300 |       2400 | A100    |
+| Intel Gaudi2              |      24x100 |       2400 |         |
+| InfiniBand XDR1600        |       8x200 |       1600 |         |
+| NVIDIA NVLink Switch gen1 |       8x150 |       1200 | V100    |
+| Intel GPUDirect-TCPX      |       4x200 |        800 |         |
+| HPE Slingshot             |       4x200 |        800 |         |
+| Omni-Path CN100           |       8x100 |        800 |         |
+| AWS EFA v1                |       4x100 |        400 |         |
+| InfiniBand NDR400         |       4x100 |        400 |         |
+|                           |             |            |         |
+| in the future:            |             |            |         |
+|                           |             |            |         |
+| Omni-Path CN5000          |       8x400 |       3200 | Q3-2024 |
+| InfiniBand GDR3200        |       8x400 |       3200 | 2025    |
+
+Notes:
+
+* these are common/popular node setups - some custom nodes may have a different configuration more often with less NICs and rarely with more NICs. And, yes, AWS EFA v2 puts 32 NICs on each node - that must be a lot of wires.
+
+You will find the details analysis of each technology in the following sections.
+
+### NVLink Switch
+
+While [NVSwitch](#nvswitch) (Layer 1 switch) is used for intra-node communications (L1), NVLink Switch (Layer 2 switch) is used for inter-node communications. The links use the same speeds as NVLink - so when both are used inter- and intra-node bandwidth per link is the same.
+
+For the actual bandwidth see [NVLink](#nvlink).
+
+NVLinks Switch gen3 replaces the normal network with [NVLink Network](https://developer.nvidia.com/blog/upgrading-multi-gpu-interconnectivity-with-the-third-generation-nvidia-nvswitch/) (scroll down to NVLink Network) which enabled
+
+### InfiniBand
+
+[InfiniBand](https://en.wikipedia.org/wiki/InfiniBand) (IB) has been around for a few decades so there are many available configurations that can be found out there. So that if someone says they have InfiniBand that is insufficient information. What you need to know is the signaling rate and the number of IB links.
+
+InfiniBand is a complete network protocol that implements RDMA (bypasses TCP/IP).
+
+Here are the most recent signaling rates which you are likely to see in the current hardware offerings:
+
+Signaling rate of uni-directional links in Gbps:
+| Links | EDR | HDR |  NDR |  XDR |  GDR |  LDR |
+| ----: | --: | --: |  --: |  --: |  --: |  --: |
+|     1 |  25 |  50 |  100 |  200 |  400 |  800 |
+|     4 | 100 | 200 |  400 |  800 | 1600 | 3200 |
+|     8 | 200 | 400 |  800 | 1600 | 3200 | 4800 |
+|    12 | 300 | 600 | 1200 | 2400 | 4800 | 9600 |
+
+Notes:
+* the GDR is planned in 2025 and LDRs some years later
+
+Latency in usecs:
+| EDR | HDR | NDR | XDR | GDR | LDR |
+| --: | --: | --: | --: | --: | --: |
+| 0.5 | 0.6 | ??  | ??  | ??  | ??  |
+
+`??` = NDR and later didn't publish latency data
+
+InfiniBand provides [RDMA](https://en.wikipedia.org/wiki/Remote_direct_memory_access).
+
+Here are some examples of NVIDIA devices with the fastest IB:
+
+- One configuration of NVIDIA DGX H100 comes with 8x NVIDIA ConnectX-7 Ethernet/InfiniBand ports each of 200Gbps, for a total of 1.6 Gbps to connect with other DGX servers.
+- For DGX H100 SuperPOD the ConnectX-7s across all 32 DGX servers and associated InfiniBand switches provide 25.6 TBps of full duplex bandwidth for use within the pod or for scaling out the multiple SuperPODs - that is an equivalent of 0.8 TBps per node (6.4Tbps!).
+
+According to wikipedia while [InfiniBand](https://en.wikipedia.org/wiki/InfiniBand) used to have multiple manufacturers - at the moment it's just Intel (purchased QLogic) and NVIDIA (purchased Mellanox). Also see [InfiniBand Trade Association](https://www.infinibandta.org/).
+
+Practical links:
+- [InfiniBand Utilities](https://docs.nvidia.com/networking/display/ofedv512580/infiniband+fabric+utilities) (the link could be outdated as it's versioned) - these are useful when debugging an IB setup.
+
+### NVIDIA Quantum-2 InfiniBand
+
+[NVIDIA Quantum-2 InfiniBand Platform](https://www.nvidia.com/en-us/networking/quantum2/) supports 400Gbps bandwidth per link, provides RDMA, includes in-network computing with [SHARP](#sharp), supports PCIe-5.
+
+The switches can connect 64 devices at 400Gbps.
+
+Besides [NVLink Switch](#nvlink-switch) this is the only other tech that powers the current fastest H100 nodes in the industry.
+
+
+### EFA
+
+[Elastic Fabric Adapter (EFA)](https://aws.amazon.com/hpc/efa/) is a recent inter-node networking technology created by AWS.
+
+- EFA v1 0.4 Tbps (effective 340 Gbps for all_reduce tests) (P4 AWS instances)
+- EFA v2 3.2 Tbps (since Q3-2023, P5 AWS instances - 32 NICs!)
+
+
+### Gaudi2 (inter-node)
+
+According to [Gaudi2 spec](https://habana.ai/wp-content/uploads/2023/10/HLS-Gaudi2_Datasheet_10_23.pdf), these nodes provide `3*8=24` NICs of 100GbE RoCE v2 RDMA for a total of 2.4Tbps of inter-node connectivity with other Gaudi2 nodes.
+
+
+
+### HPE Slingshot interconnect
+
+[HPE Slingshot interconnect](https://www.hpe.com/ca/en/compute/hpc/slingshot-interconnect.html) seems to be used by HPCs. As of this writing it provides 200Gbps per link. Some HPCs use 4 of those links to build 800Gbps interconnects, and, of course, with more links will deliver a higher overall bandwidth.
+
+
+
+### GPUDirect-TCPX
+
+GPUDirect-TCPX is a new hardware/software networking stack introduced in A3 instances of GCP. The docs are scarce, but here is [some information](https://cloud.google.com/compute/docs/gpus/gpudirect).
+
+
+
+### Omni-Path
+
+[Omni-Path Architecture](https://en.wikipedia.org/wiki/Omni-Path) (OPA). Originally by Intel, the technology got sold to Cornelis Networks.
+
+case study: I used this technology at JeanZay HPC in France in 2022. It was only 135Gbps and while the vendor tried to fix it a year later it was still the same speed. Hopefully the issue has been resolved and the speed is much faster nowadays. Because it was so slow we had to use [Megatron-Deepspeed](https://github.com/bigscience-workshop/Megatron-DeepSpeed) for training BLOOM-176B instead of the much easier to use DeepSpeed ZeRO).
+
+As of this writing I see that the product comes with either 100 or 200Gbps bandwidth. So it's unlikely you will see anybody offering this solution for ML workloads, unless they manage to install many NICs perhaps?
+
+[CN-100](Cornelis Omni-Path Accelerated Host Fabric Adapter CN-100HFA) 100Gbps NICs have been around for many years now.
+
+[CN5000](https://www.cornelisnetworks.com/solutions/cornelis-cn5000/) 400Gbps NICs will be launched by Cornelis Networks in Q3-2024. One upcoming MI300X setup uses 8x of these for 3200Gbps of total unidirectional inter-node bandwidth.
+
+Omni-Path provides [RDMA](https://en.wikipedia.org/wiki/Remote_direct_memory_access).
+
+
+
+
+
+## Other essential network technologies
+
+### SHARP
+
+NVIDIA [Scalable Hierarchical Aggregation and Reduction Protocol (SHARP)](https://docs.nvidia.com/networking/display/sharpv300) - allows performing data reductions and aggregations on the network itself (in-network computing). This is very useful if you do a lot of MPI, NCCL and other network collectives that support SHARP, as those should get their latencies much improved.
+
+To understand the importance of this technology - for all-reduce operations, instead of 2N sends, it will only need N+1 sends - so for a large N - it almost doubles the effective all-reduce throughput. (N is the number of communicating ranks/gpus). For details see [all-reduce operation compatibility](https://developer.nvidia.com/blog/upgrading-multi-gpu-interconnectivity-with-the-third-generation-nvidia-nvswitch/) (you'd have to scoll down to get to that section).
+
+Recent NCCL versions will automatically use this technology if it is available.
+
+The SHARP hardware that is part of the NVSwitch or Infiniband switches includes arithmetic logic units (ALU) that perform the compute directly rather than using GPUs. It's said that it can peform math in FP64, FP32, FP16 and BF16 dtypes.
+
+case study: I discovered SHARP accidentally when an H100 intra-node NVLink 4.0 [all-reduce](benchmarks/all_reduce_bench.py) benchmark reported 480GBps for a 4GB payload when the theoretical spec was only 450GBps! We figured out it's because NCCL turned on the new `NVLS` algo as it detected Infiniband SHARP. I still don't understand how it clocked speed faster than what the physical medium allows. I'm pretty sure that `busbw` calculation algorithm needs to be adjusted there from 2N to N+1 to get the real speed.
 
 
 ## Understanding why inter-node network speed is of a huge importance
@@ -192,7 +558,7 @@ So continuing this train of thought it means that the setup will have about 156T
 
 Earlier we said that a typical A100 node has an intra-node NVLink connection of 300GBps, and thus we said that to send 16GB of grads will take `16/300` = 0.053 secs.
 
-And we measured our compute to be 0.42 secs, so here we have a problem as `0.053 > 0.42` so the comms will be slower than compute and the network is a bottleneck.
+And we measured our compute to be 0.42 secs, so here the network isn't a bottleneck as `0.42 > 0.053` so the compute will be slower than communication.
 
 You can now do several thought experiments - for example if you halve the batch size or the sequence length you will halve the compute time.
 
@@ -244,192 +610,10 @@ It can be difficult to do even approximate math as we did in this chapter, becau
 As I have shown in these sections it should be possible to be able to do a back-of-envelope calculations once you understand the specific scalability technique and its networking costs, so that you could know ahead of time which Inter-node network speed you need to require from your acquisition manager. Of course, you also need to understand the particular model architecture and calculate how many TFLOP it will take to do a single iteration.
 
 
-### Unidirectional vs Bidirectional (Duplex)
 
-Most benchmarking / bandwidth measurement tools will report a unidirectional bandwidth. So be careful when you look at unidirectional vs. bidirectional (duplex) speeds. Typically the latter is ~2x faster.
 
-If you measure the bandwidth on your setup and it's about 40% of the advertised speed, carefully check if the advertised speed said duplex and if so half that and then your measured bandwidth should now be about 80% which is expected.
 
-case study: for a while I couldn't understand why when I run the nccl-tests all_reduce benchmark on an A100 node with advertised 600GBps intra-node speed I was getting only 235Gbps (40%) until Horace He kindly pointed out that I should be looking at unidirectional speed which is 300GBps, and then I get 80% of the theoretical spec which checks out.
 
-
-
-## Intra-node networking
-
-There are multiple platforms/solutions out there that provide intra-node networking:
-
-1. Generic: [PCIe](#pcie)
-2. NVIDIA: [NVLink](#nvlink) and [NVSwitch](#nvswitch)
-3. AMD: [Infinity Fabric](#infinity-fabric--xgmi)
-4. Intel: [Gaudi2](#gaudi2)
-
-footnote: In the following sections pay close attention that 1 GBps = 8 Gbps.
-
-footnote: also pay close attention to when the spec says unidirectional vs bidirectional (duplex) speeds - if you read an online spec and it doesn't explicitly declare the directionality - look for an answer. I had to research many docs to figure it out in some of the tables below as some vendors conveniently omit this crucial information. I even had to edit a few wiki pages to add the missing information. Remember that for the vendors the bigger the better so almost always they will use the duplex number, which is 2x larger than unidirectional one.
-
-
-
-### PCIe
-
-[PCIe](https://en.wikipedia.org/wiki/PCI_Express) is a high-speed serial computer expansion bus standard that can be found even on the cheapest computer desktop.
-
-| Interconnect  | Lane/Direction   |   Lanes | Unidirection   | Duplex     |
-| :------------ | ---------------: | ------: | -------------: | ---------: |
-| PCIe 4        | ~2.0 GBps        |      16 | 31 GBps        | 62 GBps    |
-| PCIe 5        | ~4.0 GBps        |      16 | 63 GBps        | 126 GBps   |
-| PCIe 6        | ~7.5 GBps        |      16 | 121 GBps       | 241 GBps   |
-| PCIe 7        | ~15.0 GBps       |      16 | 242 GBps       | 484 GBps   |
-
-If one compares the latest generations of different intra-node technologies (see the following sections) PCIe is usually an order of magnitude behind.
-
-
-
-### NVLink
-
-- [NVLink](https://en.wikipedia.org/wiki/NVLink) is a wire-based serial multi-lane near-range communications link developed by Nvidia. Here is the [What Is NVLink](https://blogs.nvidia.com/blog/2023/03/06/what-is-nvidia-nvlink/) blog post with more background on it.
-
-I found the wiki pages quite difficult to follow, so I will try to help bring clarity into this.
-
-Effective payload rate of Intra-node GPU-to-GPU communication hardware:
-
-| Interconnect | Lane/Direction | Lanes | Links | Unidirection | Duplex   |
-|:------------ |---------------:|------:|------:|-------------:|---------:|
-| NVlink 2     | 6.250 GBps     |     4 |     6 | 150 GBps     | 300 GBps |
-| NVlink 3     | 6.250 GBps     |     4 |    12 | 300 GBps     | 600 GBps |
-| NVlink 4     | 6.250 GBps     |     4 |    18 | 450 GBps     | 900 GBps |
-
-
-NVlink 2, 3 and 4 use the same hardware of 4 lanes of 6.250 GBps each per link. Each has a unidirectional bandwidth of 25GB/s per link, and therefore 50GB/s per duplex link. The only difference is in the number of links:
-
-- NVLink 2 has  6 links => `25* 6`=> 150 GBps unidirectional and 300 GBps bi-directional
-- NVLink 3 has 12 links => `25*12`=> 300 GBps unidirectional and 600 GBps bi-directional
-- NVLink 4 has 18 links => `25*18`=> 450 GBps unidirectional and 900 GBps bi-directional
-
-The largest PCIe 16x slot has 16 lanes. Smaller slots have less lanes, 1x == 1 lane.
-
-As of this writing NVIDIA Hopper nodes typically come equipped with PCIe 5 and NVLink 4. So there NVlink is 7x faster than PCIe.
-
-Let's look at several examples of nodes and correlate the theory with reality.
-
-If you use multiple GPUs the way cards are inter-connected can have a huge impact on the total training time. If the GPUs are on the same physical node, you can run:
-
-```
-nvidia-smi topo -m
-```
-
-and it will tell you how the GPUs are inter-connected.
-
-On a machine with dual-GPU and which are connected with NVLink, you will most likely see something like:
-
-```
-        GPU0    GPU1    CPU Affinity    NUMA Affinity
-GPU0     X      NV2     0-23            N/A
-GPU1    NV2      X      0-23            N/A
-```
-
-on a different machine w/o NVLink you may see:
-```
-        GPU0    GPU1    CPU Affinity    NUMA Affinity
-GPU0     X      PHB     0-11            N/A
-GPU1    PHB      X      0-11            N/A
-```
-
-The report includes this legend:
-
-```
-  X    = Self
-  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
-  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
-  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
-  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
-  PIX  = Connection traversing at most a single PCIe bridge
-  NV#  = Connection traversing a bonded set of # NVLinks
-```
-
-So the first report `NV2` tells us the GPUs are interconnected with 2 NVLinks, and the second report `PHB` we have a typical consumer-level PCIe+Bridge setup.
-
-Check what type of connectivity you have on your setup. Some of these will make the communication between cards faster (e.g. NVLink), others slower (e.g. PHB).
-
-Depending on the type of scalability solution used, the connectivity speed could have a major or a minor impact. If the GPUs need to sync rarely, as in DDP, the impact of a slower connection will be less significant. If the GPUs need to send messages to each other often, as in ZeRO-DP, then faster connectivity becomes super important to achieve faster training.
-
-Now, let's look at the topology of the A100 and H100 nodes:
-
-
-- A100 topology:
-
-```
-$ nvidia-smi topo -m
-      GPU0  GPU1  GPU2  GPU3  GPU4  GPU5  GPU6  GPU7  CPU Affinity  NUMA Affinity
-GPU0   X    NV12  NV12  NV12  NV12  NV12  NV12  NV12   0-23         0
-GPU1  NV12   X    NV12  NV12  NV12  NV12  NV12  NV12   0-23         0
-GPU2  NV12  NV12   X    NV12  NV12  NV12  NV12  NV12   0-23         0
-GPU3  NV12  NV12  NV12   X    NV12  NV12  NV12  NV12   0-23         0
-GPU4  NV12  NV12  NV12  NV12   X    NV12  NV12  NV12  24-47         1
-GPU5  NV12  NV12  NV12  NV12  NV12   X    NV12  NV12  24-47         1
-GPU6  NV12  NV12  NV12  NV12  NV12  NV12   X    NV12  24-47         1
-GPU7  NV12  NV12  NV12  NV12  NV12  NV12  NV12   X    24-47         1
-```
-You can see there are 12 NVLinks and 2 NUMA Groups (2 CPUs w/ 24 cores each)
-
-- H100 topology:
-```
-$ nvidia-smi topo -m
-      GPU0  GPU1  GPU2  GPU3  GPU4  GPU5  GPU6  GPU7  CPU Affinity  NUMA Affinity
-GPU0   X    NV18  NV18  NV18  NV18  NV18  NV18  NV18   0-51         0
-GPU1  NV18   X    NV18  NV18  NV18  NV18  NV18  NV18   0-51         0
-GPU2  NV18  NV18   X    NV18  NV18  NV18  NV18  NV18   0-51         0
-GPU3  NV18  NV18  NV18   X    NV18  NV18  NV18  NV18   0-51         0
-GPU4  NV18  NV18  NV18  NV18   X    NV18  NV18  NV18  52-103        1
-GPU5  NV18  NV18  NV18  NV18  NV18   X    NV18  NV18  52-103        1
-GPU6  NV18  NV18  NV18  NV18  NV18  NV18   X    NV18  52-103        1
-GPU7  NV18  NV18  NV18  NV18  NV18  NV18  NV18   X    52-103        1
-```
-You can see there are 18 NVLinks and 2 NUMA Groups (2 CPUs w/ 52 cores each)
-
-Of course, other A100 and H100s node reports may vary, e.g. different number of cpu cores.
-
-
-
-
-### NVSwitch
-
-[NVSwitch](https://www.nvidia.com/en-us/data-center/nvlink/) can connect more than 8 GPUs at the speed of [NVLink](#nvlink). It's advertised to connect up to 256 GPUs in the future generations of the switch.
-
-The benefit of connecting more than 8 GPUs at the speed of NVLink is that it allows all-to-all GPU communications at a much faster speed than any intra-node hardware can provide. And with ever increasing compute speeds the network is the likely bottleneck leading to underutilized super-expensive GPUs.
-
-For example, in the universe of Tensor Parallelism (Megatron), one doesn't use TP degree of more than 8, because TP is only efficient at NVLink speed. ZeRO-DP (Depspeed/FSDP) would also run much faster if the whole cluster uses NVLink speed and involves no slow inter-node connections.
-
-The [NVIDIA DGX H100](https://developer.nvidia.com/blog/upgrading-multi-gpu-interconnectivity-with-the-third-generation-nvidia-nvswitch/) has a 3.6 TBps of full-duplex NVLink Network bandwidth provided by 72 NVLinks (NVLink 4). The normal NVlink 4 has 18 NVLinks (0.9 TBps duplex). So this setup has 4 switches (`18*4=72`) and therefore `0.9*4=3.6` TBps. Note, that this server has 8 GPUs, so here we get a much faster intra-node communications as compared to the standard NVlink 4.0 which provides only 0.9 TBps all-to-all connectivity for 8 GPUs.
-
-NVIDIA DGX A100 has 6 switches of 12 NVlinks for a total of 72.
-
-[DGX H100 SuperPOD](https://developer.nvidia.com/blog/upgrading-multi-gpu-interconnectivity-with-the-third-generation-nvidia-nvswitch/) combines 32 DGX H100 servers, for a total of 256 GPUs. It looks like here they use only half the NVLinks they used for a single DGX H100, so only 1.8 GBps per node, for a total of 57.6 GBps in total.
-
-
-
-### Infinity Fabric / xGMI
-
-AMD MI* Accelerators Intra-node communication is performed by AMD Infinity Fabric, which is also known as xGMI (Socket to Socket Global Memory Interface).
-
-This is AMD's answer to [NVLink](#nvlink).
-
-| Interconnect  | Link/Direction | Links | Unidirection | Duplex     |
-| :------------ | -------------: | ----: | -----------: | ---------: |
-| MI250x        | 50 GBps        |     7 | 350 GBps     | 700 GBps   |
-| MI300x        | 64 GBps        |     7 | 448 GBps     | 896 GBps   |
-|               |                |       |              |            |
-
-![AMD Infinity Platform Architecture](images/amd-infinity-arch-MI300X.png)
-
-Platform specs:
-- [MI250X](https://www.amd.com/en/products/accelerators/instinct/mi200/mi250x.html)
-- [MI300x](https://www.amd.com/en/products/accelerators/instinct/mi300/platform.html)
-
-
-
-### Gaudi2
-
-According to [Gaudi2 spec](https://habana.ai/wp-content/uploads/2023/10/HLS-Gaudi2_Datasheet_10_23.pdf), these servers provide 8x 21 NICs of 100GbE RoCE v2 ROMA for a total of 2.1TBps and each card connected with each of the other 7 cards at 262.5 GBps.
 
 
 ## NUMA Affinity
@@ -474,76 +658,6 @@ Some useful suggestions in [pytorch docs](https://pytorch.org/tutorials/recipes/
 
 
 
-
-
-## Inter-node networking
-
-As inter-node hardware is about of an order of magnitude slower than intra-node hardware in this universe Gbps are used instead of GBps. (1 GBps = 8 Gbps)
-
-When it comes to inter-node networking hardware, there are the well established InfiniBand from NVIDIA and a few other players and there are many new comers that mainly are coming from compute cloud providers who can't compete on the slim margin renting out someone else's hardware so they build their own (EFA, and others not yet disclosed).
-
-
-
-### EFA
-
-[Elastic Fabric Adapter (EFA)](https://aws.amazon.com/hpc/efa/) is a recent technology created by AWS.
-
-- EFA v1 0.4 Tbps (effective 340 Gbps for all_reduce tests) (P4 AWS instances)
-- EFA v2 3.2 Tbps (since Q3-2023, P5 AWS instances)
-
-
-
-### InfiniBand
-
-Now [InfiniBand](https://en.wikipedia.org/wiki/InfiniBand) (IB) has been around for a few decades so there are many available configurations that can be found out there. So that if someone says they have InfiniBand that is insufficient information. What you need to know is the signaling rate and the number of IB links.
-
-Here are the most recent signaling rates which you are likely to see in the current hardware offerings:
-
-Signaling rate of uni-directional links in Gbps:
-| Links | EDR | HDR |  NDR |  XDR |  GDR |
-| ----: | --: | --: |  --: |  --: |  --: |
-|     1 |  25 |  50 |  100 |  200 |  400 |
-|     4 | 100 | 200 |  400 |  800 | 1600 |
-|     8 | 200 | 400 |  800 | 1600 | 3200 |
-|    12 | 300 | 600 | 1200 | 2400 | 4800 |
-
-Latency in usecs:
-| EDR | HDR | NDR | XDR | GDR |
-| --: | --: | --: | --: | --: |
-| 0.5 | 0.6 | ??  | ??  | ??  |
-
-`??` = NDR and later didn't publish latency data
-
-InfiniBand provides [RDMA](https://en.wikipedia.org/wiki/Remote_direct_memory_access).
-
-Here are some examples of NVIDIA devices with the fastest IB:
-
-- One configuration of NVIDIA DGX H100 comes with 8x NVIDIA ConnectX-7 Ethernet/InfiniBand ports each of 200Gbps, for a total of 1.6 Gbps to connect with other DGX servers.
-- For DGX H100 SuperPOD the ConnectX-7s across all 32 DGX servers and associated InfiniBand switches provide 25.6 TBps of full duplex bandwidth for use within the pod or for scaling out the multiple SuperPODs - that is an equivalent of 0.8 TBps per node (6.4Tbps!).
-
-
-
-### Gaudi2
-
-According to [Gaudi2 spec](https://habana.ai/wp-content/uploads/2023/10/HLS-Gaudi2_Datasheet_10_23.pdf), these servers provide 24 NICs of 100GbE RoCE v2 ROMA for a total of 2.4Tbps of inter-node connectivity with other Gaudi2 servers.
-
-
-
-### HPE Slingshot interconnect
-
-[HPE Slingshot interconnect](https://www.hpe.com/ca/en/compute/hpc/slingshot-interconnect.html) seems to be used by HPCs. As of this writing it provides 200Gbps per link. Some HPCs use 4 of those links to build 800Gbps interconnects, and, of course, with more links will deliver a higher overall bandwidth.
-
-
-
-### OmniPath
-
-[OmniPath Architecture](https://en.wikipedia.org/wiki/Omni-Path) (OPA). Originally by Intel, the technology got sold to Cornelis Networks.
-
-case study: I used this technology at JeanZay HPC in France in 2022. It was only 135Gbps and while the vendor tried to fix it a year later it was still the same speed. Hopefully the issue has been resolved and the speed is much faster nowadays. Because it was so slow we had to use [Megatron-Deepspeed](https://github.com/bigscience-workshop/Megatron-DeepSpeed) for training BLOOM-176B instead of the much easier to use DeepSpeed ZeRO).
-
-As of this writing I see that the product comes with either 100 or 200Gbps bandwidth. So it's unlikely you will see anybody offering this solution for ML workloads, unless they manage to install many NICs perhaps?
-
-Omni-Path provides [RDMA](https://en.wikipedia.org/wiki/Remote_direct_memory_access).
 
 
 ## Important nuances
@@ -629,6 +743,23 @@ Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)
 
 As you can see in the Unidirectional section of the report we do get 274 GBps out of the advertised 300GBps (~91%).
 
+Please note that when I re-run this same test on H100s (NVLink 4.0) I got a much worse efficiency:
+
+```
+Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)
+   D\D     0      1      2      3      4      5      6      7
+     0 2494.51 364.13 375.99 378.03 376.77 376.71 374.85 375.66
+     1 375.18 2533.95 376.08 374.98 376.21 375.96 375.76 375.12
+     2 363.43 393.28 2532.67 376.35 377.14 376.47 375.76 375.48
+     3 369.90 375.92 393.63 2525.38 376.58 375.88 376.13 377.01
+     4 376.20 376.28 375.20 393.52 2526.02 375.82 375.05 376.10
+     5 376.26 376.60 375.54 375.52 376.81 2521.18 376.37 376.60
+     6 374.31 376.19 376.80 376.32 376.83 376.44 2529.85 376.39
+     7 376.17 376.49 376.53 374.95 376.30 376.82 375.71 2519.78
+```
+
+So 376GBps out of 450GBps is 83% (not very good).
+
 Bottom line - in this particular setup:
 1. if you have huge payloads you will be able to use about 80% of the advertised 300GBps
 2. if the payload of each communication is smallish it could be far far lower.
@@ -638,7 +769,7 @@ This graph is also helpful to demonstrate how the actual bandwidth changes with 
 ![Low-level Uni-directional Bandwidth Measurements](images/ccgrid11-uni-direction-bandwidth.png)
 ([source](https://ieeexplore.ieee.org/document/5238655))
 
-
+Another tool for bandwidth measurements on NVIDIA GPUs is [NVIDIA/nvbandwidth](https://github.com/NVIDIA/nvbandwidth).
 
 ### Latency
 
@@ -681,3 +812,9 @@ If you use a shared HPC environment, or even if you have your own cluster but sh
 This situation unfortunately makes it extremely difficult to finetune the performance of your training setup. Since every time you run a test the TFLOPs will vary, so how do you do the optimization? Unfortunately I don't have a magic trick here. If you have a working solution please kindly share.
 
 case study: we had this issue at JeanZay HPC when we were doing preliminary experiments before we started training BLOOM-176B. As that HPC has many users it was pretty much impossible to do speed optimizations, as even running the exact same setup again and again gave different throughput results. Luckily just before we launched BLOOM-176B training we were given an exclusive access to the new at that time A100 partition so we were the only users and we were able to greatly optimize the throughput.
+
+
+## Contributors
+
+[Oren Leung](https://github.com/OrenLeung),
+[Stéphane Requena](https://twitter.com/s_requena),

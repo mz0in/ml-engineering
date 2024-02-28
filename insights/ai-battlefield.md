@@ -168,7 +168,9 @@ Cons:
 
 
 
+### Managing compute
 
+- Unless you use a fully managed HPC compute you absolutely need to hire a sysadmin. It may feel that your ML engineers can swing that between their training jobs, but they will be losing a lot of time to managing disk space, dealing with problematic nodes, asking users to behave, etc.
 
 
 
@@ -275,9 +277,9 @@ Emerging to general availability:
 
   * NVIDIA H100 - 2-3x faster than A100 (half precision), 6x faster for fp8
 
-  * AMD MI250 ~= A100 - very few clouds have them
+  * AMD MI250 ~= A100 - very few clouds have them and most likely MI300X will be the first mainstream AMD GPU
 
-  * AMD MI300 ~= H100 - don't expect until 1.5-2 years from now to be GA
+  * AMD MI300X ~= H100 - a few clouds will have those in March, 2024
 
   * Intel Gaudi2 ~= H100 - starting to slowly emerge on Intel's cloud
 
@@ -285,19 +287,18 @@ Emerging to general availability:
 
   * Cerebras WaferScale Engine - available on Cerebras' cloud
 
-
+For the full list see [Accelerators](../compute/accelator).
 
 
 #### Accelerator Interoperability
 
 In general most (all?) accelerators are supported by major frameworks like PyTorch or TensorFlow and the same code should run everywhere with small modifications as long as it doesn't use any accelerator-specific functionality.
 
-For example, if your PyTorch application includes custom CUDA kernels it'll only work on NVIDIA GPUs and may be on AMD MI-series.
-
+For example, if your PyTorch application calls `torch.mm` - it should work everywhere, but if it includes custom CUDA kernels it'll only work on NVIDIA GPUs and may be on the recent AMD MI-series.
 
 - NVIDIA GPUs: all based on [CUDA](https://developer.nvidia.com/cuda-toolkit), which most training frameworks support. You can easily moved between different NVIDIA GPUs and most things would work the same.
 
-- AMD MI250/MI300: with PyTorch using [ROCm](https://pytorch.org/blog/pytorch-for-amd-rocm-platform-now-available-as-python-package/) you can run most CUDA-based software as is. This is really the only inter-operable accelerator with the NVIDIA stack.
+- AMD MI250/MI300X: with PyTorch using [ROCm](https://pytorch.org/blog/pytorch-for-amd-rocm-platform-now-available-as-python-package/) you can run most CUDA-based software as is. This is really the only inter-operable accelerator with the NVIDIA stack.
 
 - Gaudi2: if you use HF Transformers/Diffusers you can use [optimum-habana](https://github.com/huggingface/optimum-habana). If you use HF Trainer with NVIDIA GPUs it should be relatively easy to switch to train/infer on Gaudi2.
 
@@ -359,7 +360,7 @@ Intel Gaudi2:
 
 - You need to reduce gradients and other bits faster than compute to avoid idling accelerators
 
-- You typically get at most 80% of advertised speed. e.g., if you are told you get 800Gbps, expect ~480Gbps.
+- You typically get at most 80% of advertised speed. e.g., if you are told you get 800Gbps, expect ~640Gbps.
 
 - If moving to fp8 H100 is 18x faster than V100
 
